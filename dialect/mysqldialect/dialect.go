@@ -49,6 +49,7 @@ func New(opts ...DialectOption) *Dialect {
 		feature.SelectExists |
 		feature.CompositeIn |
 		feature.FKDefaultOnAction |
+		feature.WindowFunctions |
 		feature.UpdateOrderLimit |
 		feature.DeleteOrderLimit
 

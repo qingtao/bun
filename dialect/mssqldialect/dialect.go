@@ -52,7 +52,8 @@ func New(opts ...DialectOption) *Dialect {
 		feature.FKDefaultOnAction |
 		feature.Merge |
 		feature.UpdateFromTable |
-		feature.MSSavepoint
+		feature.MSSavepoint |
+		feature.WindowFunctions
 
 	d.unicode = true
 

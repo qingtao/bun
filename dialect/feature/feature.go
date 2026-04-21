@@ -38,6 +38,8 @@ const (
 	// OffsetFetch enables OFFSET ... FETCH NEXT syntax (MSSQL).
 	OffsetFetch
 	// SelectExists enables EXISTS subquery expressions.
+	// WindowFunctions enables window functions such as ROW_NUMBER().
+	WindowFunctions
 	SelectExists
 
 	// INSERT features.
@@ -145,6 +147,7 @@ var flag2str = map[Feature]string{
 	// SELECT features.
 	OffsetFetch:  "OffsetFetch",
 	SelectExists: "SelectExists",
+	WindowFunctions: "WindowFunctions",
 
 	// INSERT features.
 	InsertReturning:      "InsertReturning",

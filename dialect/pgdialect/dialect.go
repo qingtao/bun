@@ -56,6 +56,7 @@ func New(opts ...DialectOption) *Dialect {
 		feature.GeneratedIdentity |
 		feature.CompositeIn |
 		feature.FKDefaultOnAction |
+		feature.WindowFunctions |
 		feature.DeleteReturning |
 		feature.Merge |
 		feature.MergeReturning |
