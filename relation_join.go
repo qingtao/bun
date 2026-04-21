@@ -211,9 +211,12 @@ func (j *relationJoin) manyQueryWithWindowFunction(limit, offset int64, q *Selec
 
 	// Apply all user conditions from tempQ to the inner query
 	q.where = tempQ.where
-	q.order = tempQ.order
 	q.group = tempQ.group
 	q.having = tempQ.having
+	// Note: We DON'T copy q.order here because:
+	// 1. We've already extracted orderByCols from tempQ.order for the window function
+	// 2. The ORDER BY in the subquery is unnecessary since we only use id and _bun_row_num
+	// 3. The window function already defines the ordering
 
 	// Build window function
 	// PARTITION BY: using the join keys (foreign key in child table)
@@ -270,13 +273,12 @@ func (j *relationJoin) manyQueryWithWindowFunction(limit, offset int64, q *Selec
 	}
 	outerQ = outerQ.Model(q.tableModel)
 
-	// Apply base WHERE conditions to outer query
-	outerQ = outerQ.Where(internal.String(buildBaseWhere()))
-
-	// Apply user's conditions to outer query
-	j.applyTo(outerQ)
-	outerQ.setLimit(0)
-	outerQ.setOffset(0)
+	// Note: We DON'T apply base WHERE conditions or user conditions to outer query here
+	// because:
+	// 1. The subquery already filters by menu_id, code, deleted_at, etc.
+	// 2. The outer query only needs to filter by id IN (subquery results)
+	// 3. Applying redundant conditions would make the SQL unnecessarily verbose
+	// We'll only apply conditions that are NOT already in the subquery, if any.
 
 	// Build WHERE IN clause: id IN (SELECT _t.id FROM (innerSQL) AS _t WHERE _bun_row_num <= ?)
 	var whereInClause []byte
