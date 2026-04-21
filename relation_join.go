@@ -152,30 +152,45 @@ func (j *relationJoin) manyQueryWithWindowFunction(limit, offset int64, q *Selec
 	gen := q.db.gen
 	joinTable := j.JoinModel.Table()
 
-	// Build the WHERE clause for parent keys.
-	var where []byte
-	if len(j.Relation.JoinPKs) > 1 {
-		where = append(where, '(')
-	}
-	where = appendColumns(where, joinTable.SQLAlias, j.Relation.JoinPKs)
-	if len(j.Relation.JoinPKs) > 1 {
-		where = append(where, ')')
-	}
-	where = append(where, " IN ("...)
-	where = appendChildValues(
-		gen,
-		where,
-		j.JoinModel.rootValue(),
-		j.JoinModel.parentIndex(),
-		j.Relation.BasePKs,
-	)
-	where = append(where, ")"...)
+	// Helper function to build base WHERE clause (parent keys + additional conditions)
+	buildBaseWhere := func() []byte {
+		var where []byte
+		if len(j.Relation.JoinPKs) > 1 {
+			where = append(where, '(')
+		}
+		where = appendColumns(where, joinTable.SQLAlias, j.Relation.JoinPKs)
+		if len(j.Relation.JoinPKs) > 1 {
+			where = append(where, ')')
+		}
+		where = append(where, " IN ("...)
+		where = appendChildValues(
+			gen,
+			where,
+			j.JoinModel.rootValue(),
+			j.JoinModel.parentIndex(),
+			j.Relation.BasePKs,
+		)
+		where = append(where, ")"...)
 
-	// Apply additional join on conditions (user filter conditions)
-	if len(j.additionalJoinOnConditions) > 0 {
-		where = append(where, " AND "...)
-		where = appendAdditionalJoinOnConditions(gen, where, j.additionalJoinOnConditions)
+		// Apply additional join on conditions (user filter conditions)
+		if len(j.additionalJoinOnConditions) > 0 {
+			where = append(where, " AND "...)
+			where = appendAdditionalJoinOnConditions(gen, where, j.additionalJoinOnConditions)
+		}
+
+		// Apply polymorphic field
+		if j.Relation.PolymorphicField != nil {
+			where = append(where, " AND "...)
+			where = append(where, j.Relation.PolymorphicField.SQLName...)
+			where = append(where, " = "...)
+			where = gen.AppendQuery(where, j.Relation.PolymorphicValue)
+		}
+
+		return where
 	}
+
+	// Build the WHERE clause for the inner query
+	where := buildBaseWhere()
 
 	// Apply WHERE conditions to a temporary query to extract user conditions
 	// (except limit/offset which we handle via window function).
@@ -188,9 +203,6 @@ func (j *relationJoin) manyQueryWithWindowFunction(limit, offset int64, q *Selec
 	}
 	tempQ = tempQ.Model(j.JoinModel)
 	tempQ = tempQ.Where(internal.String(where))
-	if j.Relation.PolymorphicField != nil {
-		tempQ = tempQ.Where("? = ?", j.Relation.PolymorphicField.SQLName, j.Relation.PolymorphicValue)
-	}
 	j.applyTo(tempQ)
 
 	// Reset limit/offset in the original query since we'll handle them via window function
@@ -198,13 +210,13 @@ func (j *relationJoin) manyQueryWithWindowFunction(limit, offset int64, q *Selec
 	q.setOffset(0)
 
 	// Apply all user conditions from tempQ to the inner query
-	// This includes user filter conditions like menu_action.code IN ('add','edit')
 	q.where = tempQ.where
 	q.order = tempQ.order
 	q.group = tempQ.group
 	q.having = tempQ.having
 
-	// Build PARTITION BY columns (using the join keys - the foreign key in child table)
+	// Build window function
+	// PARTITION BY: using the join keys (foreign key in child table)
 	var partitionCols []byte
 	for i, pk := range j.Relation.JoinPKs {
 		if i > 0 {
@@ -213,7 +225,7 @@ func (j *relationJoin) manyQueryWithWindowFunction(limit, offset int64, q *Selec
 		partitionCols = append(partitionCols, pk.SQLName...)
 	}
 
-	// Get the order by columns from user conditions for window function
+	// ORDER BY: from user conditions or default to partition columns
 	var orderByCols []byte
 	if len(tempQ.order) > 0 {
 		for i, o := range tempQ.order {
@@ -223,28 +235,22 @@ func (j *relationJoin) manyQueryWithWindowFunction(limit, offset int64, q *Selec
 			orderByCols, _ = o.AppendQuery(gen, orderByCols)
 		}
 	} else {
-		// Default order by join keys
 		orderByCols = partitionCols
 	}
 
-	// Window function expression: ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY id)
 	windowExpr := fmt.Sprintf("ROW_NUMBER() OVER (PARTITION BY %s ORDER BY %s)",
 		internal.String(partitionCols), internal.String(orderByCols))
 
-	// Add window function column and primary key to the inner query
-	// We need to select the primary key (or a unique identifier) to use in the outer WHERE IN clause
+	// Get primary key fields for WHERE IN clause
 	pkFields := joinTable.PKs
 	if len(pkFields) == 0 {
-		// If no primary key is defined, use all fields that are part of the relation's base PKs
 		pkFields = j.Relation.BasePKs
 	}
 
-	// Add primary key columns to SELECT
+	// Add primary key columns and window function to SELECT
 	for _, pk := range pkFields {
 		q.addColumn(schema.QueryWithArgs{Query: string(pk.SQLName), Args: []any{}})
 	}
-
-	// Add window function column to the inner query
 	q.addColumn(schema.QueryWithArgs{Query: windowExpr + " AS _bun_row_num", Args: []any{}})
 
 	// Generate the inner query SQL
@@ -254,8 +260,7 @@ func (j *relationJoin) manyQueryWithWindowFunction(limit, offset int64, q *Selec
 		return q
 	}
 
-	// Build the outer query that uses the subquery
-	// The structure is: SELECT columns FROM table WHERE conditions AND id IN (SELECT id FROM (innerSQL) AS _t WHERE _bun_row_num <= ?)
+	// Build the outer query
 	outerQ := &SelectQuery{
 		whereBaseQuery: whereBaseQuery{
 			baseQuery: baseQuery{
@@ -265,70 +270,24 @@ func (j *relationJoin) manyQueryWithWindowFunction(limit, offset int64, q *Selec
 	}
 	outerQ = outerQ.Model(q.tableModel)
 
-	// Build the WHERE clause for parent keys on outer query
-	var outerWhere []byte
-	if len(j.Relation.JoinPKs) > 1 {
-		outerWhere = append(outerWhere, '(')
-	}
-	outerWhere = appendColumns(outerWhere, joinTable.SQLAlias, j.Relation.JoinPKs)
-	if len(j.Relation.JoinPKs) > 1 {
-		outerWhere = append(outerWhere, ')')
-	}
-	outerWhere = append(outerWhere, " IN ("...)
-	outerWhere = appendChildValues(
-		gen,
-		outerWhere,
-		j.JoinModel.rootValue(),
-		j.JoinModel.parentIndex(),
-		j.Relation.BasePKs,
-	)
-	outerWhere = append(outerWhere, ")"...)
+	// Apply base WHERE conditions to outer query
+	outerQ = outerQ.Where(internal.String(buildBaseWhere()))
 
-	// Apply additional join on conditions to outer query
-	if len(j.additionalJoinOnConditions) > 0 {
-		outerWhere = append(outerWhere, " AND "...)
-		outerWhere = appendAdditionalJoinOnConditions(gen, outerWhere, j.additionalJoinOnConditions)
-	}
-
-	// Apply polymorphic field to outer query
-	if j.Relation.PolymorphicField != nil {
-		outerWhere = append(outerWhere, " AND "...)
-		outerWhere = append(outerWhere, j.Relation.PolymorphicField.SQLName...)
-		outerWhere = append(outerWhere, " = "...)
-		outerWhere = gen.AppendQuery(outerWhere, j.Relation.PolymorphicValue)
-	}
-
-	// Apply user's apply function to outer query to get additional conditions
+	// Apply user's conditions to outer query
 	j.applyTo(outerQ)
-	// Reset limit/offset on outerQ since we handle them via window function
 	outerQ.setLimit(0)
 	outerQ.setOffset(0)
 
-	// Build the WHERE IN clause with the subquery
-	// SELECT _t.id FROM (innerSQL) AS _t WHERE _t._bun_row_num <= ?
-	var subquerySelect []byte
-	subquerySelect = append(subquerySelect, "SELECT _t."...)
-	// Add primary key column(s) to the subquery SELECT
-	for i, pk := range pkFields {
-		if i > 0 {
-			subquerySelect = append(subquerySelect, ", _t."...)
-		}
-		subquerySelect = append(subquerySelect, pk.SQLName...)
-	}
-	subquerySelect = append(subquerySelect, " FROM (?)"...)
-	subquerySelect = append(subquerySelect, " AS _t"...)
-	subquerySelect = append(subquerySelect, " WHERE _t._bun_row_num <= ?"...)
-
-	// Build the WHERE IN clause for the outer query
+	// Build WHERE IN clause: id IN (SELECT _t.id FROM (innerSQL) AS _t WHERE _bun_row_num <= ?)
 	var whereInClause []byte
+
+	// Build id IN (...)
 	if len(pkFields) == 1 {
-		// Single primary key
 		whereInClause = append(whereInClause, joinTable.SQLAlias...)
 		whereInClause = append(whereInClause, "."...)
 		whereInClause = append(whereInClause, pkFields[0].SQLName...)
 		whereInClause = append(whereInClause, " IN ("...)
 	} else {
-		// Composite primary key - use tuple comparison
 		whereInClause = append(whereInClause, "("...)
 		for i, pk := range pkFields {
 			if i > 0 {
@@ -340,33 +299,57 @@ func (j *relationJoin) manyQueryWithWindowFunction(limit, offset int64, q *Selec
 		}
 		whereInClause = append(whereInClause, ") IN ("...)
 	}
-	whereInClause = append(whereInClause, subquerySelect...)
-	whereInClause = append(whereInClause, ")"...)
 
-	// Apply the WHERE IN clause to the outer query
-	// We'll add this to the existing outerQ conditions
+	// Build SELECT _t.id FROM (...) AS _t WHERE _t._bun_row_num <= ?
+	whereInClause = append(whereInClause, "SELECT _t."...)
+	for i, pk := range pkFields {
+		if i > 0 {
+			whereInClause = append(whereInClause, ", _t."...)
+		}
+		whereInClause = append(whereInClause, pk.SQLName...)
+	}
+	whereInClause = append(whereInClause, " FROM (?)"...)
+	whereInClause = append(whereInClause, " AS _t WHERE "...)
+
+	// Build row number filter condition
+	var rowFilter []byte
 	if offset > 0 {
 		if limit > 0 {
-			// Both offset and limit are set
-			outerQ = outerQ.Where(internal.String(whereInClause),
-				schema.SafeQuery(internal.String(innerSQL), nil), offset+limit)
+			// _bun_row_num > offset AND _bun_row_num <= offset+limit
+			rowFilter = append(rowFilter, "_t._bun_row_num > ? AND _t._bun_row_num <= ?"...)
 		} else {
-			// Only offset is set
-			outerQ = outerQ.Where(internal.String(whereInClause),
-				schema.SafeQuery(internal.String(innerSQL), nil))
-			// Additional condition: _bun_row_num > offset
-			// This is more complex, for now we just apply the basic filter
+			// _bun_row_num > offset
+			rowFilter = append(rowFilter, "_t._bun_row_num > ?"...)
 		}
 	} else if limit > 0 {
-		// Only limit is set
-		outerQ = outerQ.Where(internal.String(whereInClause),
-			schema.SafeQuery(internal.String(innerSQL), nil), limit)
+		// _bun_row_num <= limit
+		rowFilter = append(rowFilter, "_t._bun_row_num <= ?"...)
 	}
 
-	// Apply the base WHERE conditions (parent keys, etc.) to outer query
-	outerQ = outerQ.Where(internal.String(outerWhere))
+	whereInClause = append(whereInClause, rowFilter...)
+	whereInClause = append(whereInClause, ")"...)
 
-	// Select the actual columns needed (excluding _bun_row_num)
+	// Apply WHERE IN clause with appropriate arguments
+	if offset > 0 {
+		if limit > 0 {
+			// Both offset and limit: _bun_row_num > offset AND _bun_row_num <= offset+limit
+			outerQ = outerQ.Where(internal.String(whereInClause),
+				schema.SafeQuery(internal.String(innerSQL), nil),
+				offset, offset+limit)
+		} else {
+			// Only offset: _bun_row_num > offset
+			outerQ = outerQ.Where(internal.String(whereInClause),
+				schema.SafeQuery(internal.String(innerSQL), nil),
+				offset)
+		}
+	} else if limit > 0 {
+		// Only limit: _bun_row_num <= limit
+		outerQ = outerQ.Where(internal.String(whereInClause),
+			schema.SafeQuery(internal.String(innerSQL), nil),
+			limit)
+	}
+
+	// Select the actual columns needed
 	outerQ = outerQ.Apply(j.hasManyColumns)
 
 	return outerQ
