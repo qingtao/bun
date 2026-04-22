@@ -42,6 +42,7 @@ func New(opts ...DialectOption) *Dialect {
 		feature.AutoIncrement |
 		feature.CompositeIn |
 		feature.FKDefaultOnAction |
+		feature.WindowFunctions |
 		feature.DeleteReturning |
 		feature.CreateIndexIfNotExists
 

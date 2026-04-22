@@ -3,6 +3,7 @@ package bun
 import (
 	"context"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/uptrace/bun/dialect/feature"
@@ -21,6 +22,10 @@ type relationJoin struct {
 	apply   func(*SelectQuery) *SelectQuery
 	columns []schema.QueryWithArgs
 }
+
+// relationJoinBuilder encapsulates SQL building logic for manyQueryWithWindowFunction.
+// It separates SQL construction concerns from the relationJoin struct.
+type relationJoinBuilder struct{}
 
 func (j *relationJoin) applyTo(q *SelectQuery) {
 	if j.apply == nil {
@@ -56,6 +61,18 @@ func (j *relationJoin) manyQuery(q *SelectQuery) *SelectQuery {
 	}
 
 	q = q.Model(hasManyModel)
+
+	// 先执行 apply 函数，让用户可以设置 limit/offset 等条件
+	j.applyTo(q)
+
+	// 检测是否设置了 limit/offset，且 dialect 支持窗口函数
+	if q.limit > 0 || q.offset > 0 {
+		if q.db.HasFeature(feature.WindowFunctions) {
+			return j.manyQueryWithWindowFunction(q.limit, q.offset, q)
+		} else {
+			internal.Warn.Printf("relation select many, but the dialect without window functions, limit will add to out query")
+		}
+	}
 
 	var where []byte
 
@@ -113,7 +130,7 @@ func (j *relationJoin) manyQueryMulti(where []byte, q *SelectQuery) *SelectQuery
 	q = q.Where(internal.String(where))
 
 	if len(j.additionalJoinOnConditions) > 0 {
-		q = q.Where(internal.String(appendAdditionalJoinOnConditions(q.db.QueryGen(), []byte{}, j.additionalJoinOnConditions)))
+		q = q.Where(internal.String(appendAdditionalJoinOnConditions(q.db.QueryGen(), nil, j.additionalJoinOnConditions)))
 	}
 
 	if j.Relation.PolymorphicField != nil {
@@ -124,6 +141,128 @@ func (j *relationJoin) manyQueryMulti(where []byte, q *SelectQuery) *SelectQuery
 	q = q.Apply(j.hasManyColumns)
 
 	return q
+}
+
+// manyQueryWithWindowFunction uses subquery with window function to implement
+// has-many relation with limit/offset. This ensures each parent record gets
+// the correct number of child records.
+//
+// The generated SQL structure is:
+// SELECT columns FROM table WHERE conditions AND id IN (
+//
+//	SELECT _t.id FROM (
+//	    SELECT ALIAS.id, ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) AS _row_num
+//	    FROM table
+//	    WHERE conditions
+//	) AS _t
+//	WHERE _t._row_num <= ?
+//
+// )
+func (j *relationJoin) manyQueryWithWindowFunction(limit, offset int64, q *SelectQuery) *SelectQuery {
+	gen := q.db.gen
+	joinTable := j.JoinModel.Table()
+	builder := relationJoinBuilder{}
+
+	// Build the WHERE clause for the inner query
+	where := builder.buildBaseWhereClause(j, gen, joinTable)
+
+	// Apply WHERE conditions to a temporary query to extract user conditions
+	// (except limit/offset which we handle via window function).
+	tempQ := &SelectQuery{
+		whereBaseQuery: whereBaseQuery{
+			baseQuery: baseQuery{
+				db: q.db,
+			},
+		},
+	}
+	tempQ = tempQ.Model(j.JoinModel)
+	tempQ = tempQ.Where(where)
+	j.applyTo(tempQ)
+
+	// Reset limit/offset in the original query since we'll handle them via window function
+	q.setLimit(0)
+	q.setOffset(0)
+
+	// Apply all user conditions from tempQ to the inner query
+	q.where = tempQ.where
+	q.group = tempQ.group
+	q.having = tempQ.having
+	// Note: We DON'T copy q.order here because:
+	// 1. We've already extracted orderByCols from tempQ.order for the window function
+	// 2. The ORDER BY in the subquery is unnecessary since we only use id and _row_num
+	// 3. The window function already defines the ordering
+
+	// Build window function
+	// PARTITION BY: using the join keys (foreign key in child table)
+	partitionCols := builder.buildPartitionColumns(joinTable, j.Relation.JoinPKs)
+
+	// ORDER BY: from user conditions or default to partition columns
+	orderByCols := builder.buildOrderByColumns(gen, tempQ, partitionCols)
+
+	// Build window expression using strings.Builder (no fmt.Sprintf)
+	windowExpr := builder.buildWindowExpression(partitionCols, orderByCols)
+
+	// Get primary key fields for WHERE IN clause
+	pkFields := joinTable.PKs
+	if len(pkFields) == 0 {
+		pkFields = j.Relation.BasePKs
+	}
+
+	// Add primary key columns and window function to SELECT using strings.Builder
+	builder.addSelectColumns(q, joinTable, pkFields, windowExpr)
+
+	// Generate the inner query SQL
+	innerSQL, err := q.AppendQuery(gen, nil)
+	if err != nil {
+		q.setErr(err)
+		return q
+	}
+
+	// Build the outer query
+	outerQ := &SelectQuery{
+		whereBaseQuery: whereBaseQuery{
+			baseQuery: baseQuery{
+				db: q.db,
+			},
+		},
+	}
+	outerQ = outerQ.Model(q.tableModel)
+
+	// Note: We DON'T apply base WHERE conditions or user conditions to outer query here
+	// because:
+	// 1. The subquery already filters by menu_id, code, deleted_at, etc.
+	// 2. The outer query only needs to filter by id IN (subquery results)
+	// 3. Applying redundant conditions would make the SQL unnecessarily verbose
+	// We'll only apply conditions that are NOT already in the subquery, if any.
+
+	// Build WHERE IN clause: id IN (SELECT _t.id FROM (innerSQL) AS _t WHERE _row_num <= ?)
+	// Using strings.Builder with Grow pre-allocation
+	whereInClause := builder.buildWhereInClause(joinTable, pkFields, limit, offset)
+
+	// Apply WHERE IN clause with appropriate arguments
+	if offset > 0 {
+		if limit > 0 {
+			// Both offset and limit: _row_num > offset AND _row_num <= offset+limit
+			outerQ = outerQ.Where(whereInClause,
+				schema.SafeQuery(string(innerSQL), nil),
+				offset, offset+limit)
+		} else {
+			// Only offset: _row_num > offset
+			outerQ = outerQ.Where(whereInClause,
+				schema.SafeQuery(string(innerSQL), nil),
+				offset)
+		}
+	} else if limit > 0 {
+		// Only limit: _row_num <= limit
+		outerQ = outerQ.Where(whereInClause,
+			schema.SafeQuery(string(innerSQL), nil),
+			limit)
+	}
+
+	// Select the actual columns needed
+	outerQ = outerQ.Apply(j.hasManyColumns)
+
+	return outerQ
 }
 
 func (j *relationJoin) hasManyColumns(q *SelectQuery) *SelectQuery {
@@ -434,9 +573,213 @@ func appendMultiValues(
 	return b
 }
 
+// buildBaseWhereClause constructs the base WHERE clause for the inner query.
+func (b *relationJoinBuilder) buildBaseWhereClause(j *relationJoin, gen schema.QueryGen, joinTable *schema.Table) string {
+	// Pre-allocate for WHERE clause: columns + " IN (...)" + conditions
+	estimatedSize := 128 + len(j.Relation.JoinPKs)*30
+	var sb strings.Builder
+	sb.Grow(estimatedSize)
+
+	// Build (col1, col2) IN (...)
+	if len(j.Relation.JoinPKs) > 1 {
+		sb.WriteByte('(')
+	}
+	for i, pk := range j.Relation.JoinPKs {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(string(joinTable.SQLAlias))
+		sb.WriteByte('.')
+		sb.WriteString(string(pk.SQLName))
+	}
+	if len(j.Relation.JoinPKs) > 1 {
+		sb.WriteByte(')')
+	}
+	sb.WriteString(" IN (")
+
+	// We need to append the actual values using the existing appendChildValues
+	// Convert to string builder pattern
+	var whereBuf []byte
+	whereBuf = append(whereBuf, []byte(sb.String())...)
+	whereBuf = appendChildValues(
+		gen,
+		whereBuf,
+		j.JoinModel.rootValue(),
+		j.JoinModel.parentIndex(),
+		j.Relation.BasePKs,
+	)
+	whereBuf = append(whereBuf, ")"...)
+
+	// Reset builder and append the WHERE clause with values
+	sb.Reset()
+	sb.Grow(len(whereBuf) + 128)
+	sb.Write(whereBuf)
+
+	// Apply additional join on conditions (user filter conditions)
+	if len(j.additionalJoinOnConditions) > 0 {
+		sb.WriteString(" AND ")
+		condBuf := appendAdditionalJoinOnConditions(gen, nil, j.additionalJoinOnConditions)
+		sb.Write(condBuf)
+	}
+
+	// Apply polymorphic field
+	if j.Relation.PolymorphicField != nil {
+		sb.WriteString(" AND ")
+		sb.WriteString(string(j.Relation.PolymorphicField.SQLName))
+		sb.WriteString(" = ")
+		valBuf := gen.AppendQuery(nil, j.Relation.PolymorphicValue)
+		sb.Write(valBuf)
+	}
+
+	return sb.String()
+}
+
+// buildPartitionColumns builds the PARTITION BY clause using strings.Builder for efficiency.
+func (b *relationJoinBuilder) buildPartitionColumns(joinTable *schema.Table, joinPKs []*schema.Field) string {
+	// Pre-allocate: average column name ~20 chars, plus ", " separator
+	estimatedSize := len(joinPKs) * (len(joinTable.SQLAlias) + 25)
+	var sb strings.Builder
+	sb.Grow(estimatedSize)
+
+	for i, pk := range joinPKs {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(string(joinTable.SQLAlias))
+		sb.WriteByte('.')
+		sb.WriteString(string(pk.SQLName))
+	}
+
+	return sb.String()
+}
+
+// buildOrderByColumns builds the ORDER BY clause using strings.Builder for efficiency.
+func (b *relationJoinBuilder) buildOrderByColumns(gen schema.QueryGen, tempQ *SelectQuery, defaultPartitionCols string) string {
+	if len(tempQ.order) > 0 {
+		// Build from user conditions
+		// Pre-allocate: "ORDER BY " (9 bytes) + average condition (40 bytes) * number of conditions
+		estimatedSize := 9 + len(tempQ.order)*40
+		var sb strings.Builder
+		sb.Grow(estimatedSize)
+
+		for i, o := range tempQ.order {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			// We can't use the builder directly with AppendQuery since it expects []byte
+			// Use a temporary buffer for each order expression
+			tmpBuf := make([]byte, 0, 128)
+			tmpBuf, _ = o.AppendQuery(gen, tmpBuf)
+			sb.Write(tmpBuf)
+		}
+
+		return sb.String()
+	}
+	// Default to partition columns
+	return defaultPartitionCols
+}
+
+// buildWindowExpression constructs the window function expression without fmt.Sprintf.
+func (b *relationJoinBuilder) buildWindowExpression(partitionCols, orderByCols string) string {
+	// Pre-allocate: "ROW_NUMBER() OVER (PARTITION BY " + partitionCols + " ORDER BY " + orderByCols + ")"
+	estimatedSize := 31 + len(partitionCols) + 11 + len(orderByCols) + 1
+	var sb strings.Builder
+	sb.Grow(estimatedSize)
+
+	sb.WriteString("ROW_NUMBER() OVER (PARTITION BY ")
+	sb.WriteString(partitionCols)
+	sb.WriteString(" ORDER BY ")
+	sb.WriteString(orderByCols)
+	sb.WriteByte(')')
+
+	return sb.String()
+}
+
+// addSelectColumns adds the primary key columns and window function to SELECT using strings.Builder.
+func (b *relationJoinBuilder) addSelectColumns(q *SelectQuery, joinTable *schema.Table, pkFields []*schema.Field, windowExpr string) {
+	// Pre-allocate for column names: alias + '.' + column name
+	estimatedSize := len(joinTable.SQLAlias) + 1 + 20
+
+	for _, pk := range pkFields {
+		var sb strings.Builder
+		sb.Grow(estimatedSize)
+
+		sb.WriteString(string(joinTable.SQLAlias))
+		sb.WriteByte('.')
+		sb.WriteString(string(pk.SQLName))
+
+		q.addColumn(schema.QueryWithArgs{Query: sb.String(), Args: []any{}})
+	}
+
+	// Add window function column
+	q.addColumn(schema.QueryWithArgs{Query: windowExpr + " AS _row_num", Args: []any{}})
+}
+
+// buildWhereInClause constructs the WHERE IN clause using strings.Builder for efficiency.
+func (b *relationJoinBuilder) buildWhereInClause(joinTable *schema.Table, pkFields []*schema.Field, limit, offset int64) string {
+	// Pre-allocate: roughly estimate based on number of PKs and template length
+	// Template: "(pk1, pk2) IN (SELECT _t.pk1, _t.pk2 FROM (?) AS _t WHERE _t._row_num <= ?)"
+	estimatedSize := 100 + len(pkFields)*30
+	var sb strings.Builder
+	sb.Grow(estimatedSize)
+
+	// Build id IN (...)
+	if len(pkFields) == 1 {
+		sb.WriteString(string(joinTable.SQLAlias))
+		sb.WriteByte('.')
+		sb.WriteString(string(pkFields[0].SQLName))
+		sb.WriteString(" IN (")
+	} else {
+		sb.WriteByte('(')
+		for i, pk := range pkFields {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(string(joinTable.SQLAlias))
+			sb.WriteByte('.')
+			sb.WriteString(string(pk.SQLName))
+		}
+		sb.WriteString(") IN (")
+	}
+
+	// Build SELECT _t.id FROM (...) AS _t WHERE _t._row_num <= ?
+	sb.WriteString("SELECT _t.")
+	for i, pk := range pkFields {
+		if i > 0 {
+			sb.WriteString(", _t.")
+		}
+		sb.WriteString(string(pk.SQLName))
+	}
+	sb.WriteString(" FROM (?) AS _t WHERE ")
+
+	// Build row number filter condition
+	if offset > 0 {
+		if limit > 0 {
+			// _row_num > offset AND _row_num <= offset+limit
+			sb.WriteString("_t._row_num > ? AND _t._row_num <= ?")
+		} else {
+			// _row_num > offset
+			sb.WriteString("_t._row_num > ?")
+		}
+	} else if limit > 0 {
+		// _row_num <= limit
+		sb.WriteString("_t._row_num <= ?")
+	}
+
+	sb.WriteByte(')')
+
+	return sb.String()
+}
+
 func appendAdditionalJoinOnConditions(
 	gen schema.QueryGen, b []byte, conditions []schema.QueryWithArgs,
 ) []byte {
+	// Smart buffer handling: if buffer is empty, create and pre-allocate
+	if len(b) == 0 {
+		estimatedSize := len(conditions) * 60
+		b = make([]byte, 0, estimatedSize)
+	}
+
 	for i, cond := range conditions {
 		if i > 0 {
 			b = append(b, " AND "...)
