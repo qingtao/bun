@@ -49,7 +49,6 @@ func New(opts ...DialectOption) *Dialect {
 		feature.SelectExists |
 		feature.CompositeIn |
 		feature.FKDefaultOnAction |
-		feature.WindowFunctions |
 		feature.UpdateOrderLimit |
 		feature.DeleteOrderLimit
 
@@ -99,7 +98,7 @@ func (d *Dialect) Init(db *sql.DB) {
 
 	version = "v" + cleanupVersion(version)
 	if semver.Compare(version, "v8.0") >= 0 {
-		d.features |= feature.CTE | feature.WithValues
+		d.features |= feature.CTE | feature.WithValues | feature.WindowFunctions
 	}
 	if semver.Compare(version, "v8.0.16") >= 0 {
 		d.features |= feature.DeleteTableAlias
