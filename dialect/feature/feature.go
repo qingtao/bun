@@ -39,8 +39,6 @@ const (
 	OffsetFetch
 	// SelectExists enables EXISTS subquery expressions.
 	SelectExists
-	// WindowFunctions enables window functions such as ROW_NUMBER().
-	WindowFunctions
 
 	// INSERT features.
 
@@ -112,6 +110,9 @@ const (
 	FKDefaultOnAction
 	// MSSavepoint enables Microsoft SQL Server savepoint support.
 	MSSavepoint
+
+	// WindowFunctions enables window functions such as ROW_NUMBER().
+	WindowFunctions
 )
 
 // NotSupportError is returned when an operation requires a feature
