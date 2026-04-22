@@ -141,12 +141,14 @@ func (j *relationJoin) manyQueryMulti(where []byte, q *SelectQuery) *SelectQuery
 //
 // The generated SQL structure is:
 // SELECT columns FROM table WHERE conditions AND id IN (
-//     SELECT _t.id FROM (
-//         SELECT id, ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) AS _bun_row_num
-//         FROM table
-//         WHERE conditions
-//     ) AS _t
-//     WHERE _t._bun_row_num <= ?
+//
+//	SELECT _t.id FROM (
+//	    SELECT ALIAS.id, ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) AS _bun_row_num
+//	    FROM table
+//	    WHERE conditions
+//	) AS _t
+//	WHERE _t._bun_row_num <= ?
+//
 // )
 func (j *relationJoin) manyQueryWithWindowFunction(limit, offset int64, q *SelectQuery) *SelectQuery {
 	gen := q.db.gen
@@ -225,6 +227,8 @@ func (j *relationJoin) manyQueryWithWindowFunction(limit, offset int64, q *Selec
 		if i > 0 {
 			partitionCols = append(partitionCols, ", "...)
 		}
+		partitionCols = append(partitionCols, joinTable.SQLAlias...)
+		partitionCols = append(partitionCols, '.')
 		partitionCols = append(partitionCols, pk.SQLName...)
 	}
 
@@ -252,7 +256,11 @@ func (j *relationJoin) manyQueryWithWindowFunction(limit, offset int64, q *Selec
 
 	// Add primary key columns and window function to SELECT
 	for _, pk := range pkFields {
-		q.addColumn(schema.QueryWithArgs{Query: string(pk.SQLName), Args: []any{}})
+		b := make([]byte, 0, 64)
+		b = append(b, joinTable.SQLAlias...)
+		b = append(b, '.')
+		b = append(b, pk.SQLName...)
+		q.addColumn(schema.QueryWithArgs{Query: string(b), Args: []any{}})
 	}
 	q.addColumn(schema.QueryWithArgs{Query: windowExpr + " AS _bun_row_num", Args: []any{}})
 
