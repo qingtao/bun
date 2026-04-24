@@ -321,6 +321,18 @@ func (j *relationJoin) m2mQuery(q *SelectQuery) *SelectQuery {
 	}
 	q = q.Model(m2mModel)
 
+	// 先执行 apply 函数，让用户可以设置 limit/offset 等条件
+	j.applyTo(q)
+
+	// 检测是否设置了 limit/offset，且 dialect 支持窗口函数
+	if q.limit > 0 || q.offset > 0 {
+		if q.db.HasFeature(feature.WindowFunctions) {
+			return j.m2mQueryWithWindowFunction(q.limit, q.offset, q)
+		} else {
+			internal.Warn.Printf("relation select m2m, but the dialect without window functions, limit will add to out query")
+		}
+	}
+
 	index := j.JoinModel.parentIndex()
 
 	if j.Relation.M2MTable != nil {
@@ -367,8 +379,177 @@ func (j *relationJoin) m2mQuery(q *SelectQuery) *SelectQuery {
 			j.Relation.M2MTable.SQLAlias, m2mJoinField.SQLName)
 	}
 
-	j.applyTo(q)
 	q = q.Apply(j.hasManyColumns)
+
+	return q
+}
+
+// m2mQueryWithWindowFunction uses subquery with window function to implement
+// many-to-many relation with limit/offset. This ensures each parent record gets
+// the correct number of child records through the join table.
+//
+// The generated SQL structure is:
+//
+//	outer: SELECT bg.book_id, genre.* FROM genres AS genre
+//	       JOIN book_genres AS bg ON bg.genre_id = genre.id
+//	       WHERE (bg.book_id, ...) IN (base_values)
+//	       AND genre.id IN (
+//	         inner: SELECT _t.id FROM (
+//	           SELECT genre.id, ROW_NUMBER() OVER (PARTITION BY bg.book_id ORDER BY genre.id) AS _row_num
+//	           FROM genres AS genre
+//	           JOIN book_genres AS bg ON bg.genre_id = genre.id
+//	           WHERE (bg.book_id, ...) IN (base_values)
+//	         ) AS _t WHERE _t._row_num <= ?
+//	       )
+func (j *relationJoin) m2mQueryWithWindowFunction(limit, offset int64, q *SelectQuery) *SelectQuery {
+	gen := q.db.gen
+	joinTable := j.JoinModel.Table()
+	m2mTable := j.Relation.M2MTable
+	builder := relationJoinBuilder{}
+
+	// Build the inner query from scratch with proper JOINs.
+	// Step 1: Extract user conditions via a temporary query.
+	tempQ := &SelectQuery{
+		whereBaseQuery: whereBaseQuery{
+			baseQuery: baseQuery{
+				db: q.db,
+			},
+		},
+	}
+	tempQ = tempQ.Model(j.JoinModel)
+	j.applyTo(tempQ)
+
+	// Step 2: Build the inner query.
+	innerQ := &SelectQuery{
+		whereBaseQuery: whereBaseQuery{
+			baseQuery: baseQuery{
+				db: q.db,
+			},
+		},
+	}
+	innerQ = innerQ.Model(j.JoinModel)
+
+	// Copy user conditions (WHERE, GROUP BY, HAVING) from tempQ BEFORE adding JOINs,
+	// because CopyConditionsFrom overwrites joins.
+	innerQ.CopyConditionsFrom(tempQ)
+
+	// Add JOIN to m2m table in the inner query (must be after CopyConditionsFrom).
+	innerQ = j.appendM2MJoin(gen, innerQ)
+
+	// Build window function.
+	// PARTITION BY: using the m2m base pk (foreign key in m2m table that references base table).
+	partitionCols := builder.buildPartitionColumns(m2mTable, j.Relation.M2MBasePKs)
+	// ORDER BY: from user conditions or default to partition columns.
+	orderByCols := builder.buildOrderByColumns(gen, tempQ, partitionCols)
+	windowExpr := builder.buildWindowExpression(partitionCols, orderByCols)
+
+	// Get primary key fields for the join table.
+	pkFields := joinTable.PKs
+	if len(pkFields) == 0 {
+		pkFields = j.Relation.JoinPKs
+	}
+
+	// Add primary key columns and window function to the inner SELECT.
+	builder.addSelectColumns(innerQ, joinTable, pkFields, windowExpr)
+
+	// Clear ORDER BY from the inner query since the window function defines the ordering.
+	innerQ.order = nil
+
+	// Generate the inner query SQL.
+	innerSQL, err := innerQ.AppendQuery(gen, nil)
+	if err != nil {
+		q.setErr(err)
+		return q
+	}
+
+	// Step 3: Build the outer query.
+	outerQ := &SelectQuery{
+		whereBaseQuery: whereBaseQuery{
+			baseQuery: baseQuery{
+				db: q.db,
+			},
+		},
+	}
+	outerQ = outerQ.Model(q.tableModel)
+
+	// Build WHERE IN clause using join table's primary keys.
+	whereInClause := builder.buildWhereInClause(joinTable, pkFields, limit, offset)
+
+	// Apply WHERE IN clause with appropriate arguments.
+	if offset > 0 {
+		if limit > 0 {
+			outerQ = outerQ.Where(whereInClause,
+				schema.SafeQuery(string(innerSQL), nil),
+				offset, offset+limit)
+		} else {
+			outerQ = outerQ.Where(whereInClause,
+				schema.SafeQuery(string(innerSQL), nil),
+				offset)
+		}
+	} else if limit > 0 {
+		outerQ = outerQ.Where(whereInClause,
+			schema.SafeQuery(string(innerSQL), nil),
+			limit)
+	}
+
+	// Add the m2m base pk columns and JOINs to the outer query.
+	if m2mTable != nil {
+		fields := j.Relation.M2MBasePKs
+		b := make([]byte, 0, len(fields))
+		b = appendColumns(b, m2mTable.SQLAlias, fields)
+		outerQ = outerQ.ColumnExpr(internal.String(b))
+	}
+
+	outerQ = j.appendM2MJoin(gen, outerQ)
+
+	// Select the actual columns needed.
+	outerQ = outerQ.Apply(j.hasManyColumns)
+
+	return outerQ
+}
+
+// appendM2MJoin adds the m2m JOIN and base table filter to a SelectQuery.
+// This produces:
+//
+//	JOIN m2m_table AS alias ON (m2m_base_pk, ...) IN (base_values)
+//	WHERE m2m_table.m2m_join_pk = join_table.join_pk
+func (j *relationJoin) appendM2MJoin(gen schema.QueryGen, q *SelectQuery) *SelectQuery {
+	m2mTable := j.Relation.M2MTable
+
+	// Build JOIN: m2m_table AS alias ON (m2m_base_pk, ...) IN (base_values)
+	var join []byte
+	join = append(join, "JOIN "...)
+	join = gen.AppendQuery(join, string(m2mTable.SQLName))
+	join = append(join, " AS "...)
+	join = append(join, m2mTable.SQLAlias...)
+	join = append(join, " ON ("...)
+	for i, col := range j.Relation.M2MBasePKs {
+		if i > 0 {
+			join = append(join, ", "...)
+		}
+		join = append(join, m2mTable.SQLAlias...)
+		join = append(join, '.')
+		join = append(join, col.SQLName...)
+	}
+	join = append(join, ") IN ("...)
+	join = appendChildValues(gen, join, j.BaseModel.rootValue(), j.JoinModel.parentIndex(), j.Relation.BasePKs)
+	join = append(join, ")"...)
+
+	if len(j.additionalJoinOnConditions) > 0 {
+		join = append(join, " AND "...)
+		join = appendAdditionalJoinOnConditions(gen, join, j.additionalJoinOnConditions)
+	}
+
+	q = q.Join(internal.String(join))
+
+	// Build WHERE: join_table.join_pk = m2m_table.m2m_join_pk
+	joinTable := j.JoinModel.Table()
+	for i, m2mJoinField := range j.Relation.M2MJoinPKs {
+		joinField := j.Relation.JoinPKs[i]
+		q = q.Where("?.? = ?.?",
+			joinTable.SQLAlias, joinField.SQLName,
+			m2mTable.SQLAlias, m2mJoinField.SQLName)
+	}
 
 	return q
 }
@@ -791,3 +972,5 @@ func appendAdditionalJoinOnConditions(
 	}
 	return b
 }
+
+
