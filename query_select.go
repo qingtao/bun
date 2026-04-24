@@ -1298,6 +1298,144 @@ func (q *SelectQuery) Clone() *SelectQuery {
 	return clone
 }
 
+// CopyConditionsFrom copies all query conditions from src to q, except limit/offset.
+// This ensures that when new condition fields are added to SelectQuery, they are
+// automatically included without needing to update callers manually.
+func (q *SelectQuery) CopyConditionsFrom(src *SelectQuery) {
+	if src == nil || q == nil {
+		return
+	}
+
+	cloneSepArgs := func(args []schema.QueryWithSep) []schema.QueryWithSep {
+		if args == nil {
+			return nil
+		}
+		clone := make([]schema.QueryWithSep, len(args))
+		for i, a := range args {
+			clone[i] = schema.SafeQueryWithSep(
+				a.Query,
+				append([]any(nil), a.Args...),
+				a.Sep,
+			)
+		}
+		return clone
+	}
+
+	// WHERE conditions
+	q.where = cloneSepArgs(src.where)
+	q.whereFields = src.whereFields
+
+	// GROUP BY
+	q.group = cloneQueryArgs(src.group)
+
+	// HAVING
+	q.having = cloneQueryArgs(src.having)
+
+	// ORDER BY (without limit/offset)
+	q.order = cloneQueryArgs(src.order)
+
+	// DISTINCT ON
+	q.distinctOn = cloneQueryArgs(src.distinctOn)
+
+	// JOINs (including ON conditions)
+	q.joins = make([]joinQuery, len(src.joins))
+	for i, j := range src.joins {
+		q.joins[i] = joinQuery{
+			join: schema.SafeQuery(j.join.Query, append([]any(nil), j.join.Args...)),
+			on:   cloneSepArgs(j.on),
+		}
+	}
+
+	// FOR (row lock)
+	if !src.selFor.IsZero() {
+		q.selFor = schema.SafeQuery(
+			src.selFor.Query,
+			append([]any(nil), src.selFor.Args...),
+		)
+	} else {
+		q.selFor = schema.QueryWithArgs{}
+	}
+
+	// UNION / INTERSECT / EXCEPT
+	q.union = make([]union, len(src.union))
+	for i, u := range src.union {
+		q.union[i] = union{
+			expr:  u.expr,
+			query: u.query.CloneConditions(),
+		}
+	}
+
+	// Index hints
+	q.idxHintsQuery.use = cloneIndexHints(src.idxHintsQuery.use)
+	q.idxHintsQuery.ignore = cloneIndexHints(src.idxHintsQuery.ignore)
+	q.idxHintsQuery.force = cloneIndexHints(src.idxHintsQuery.force)
+
+	// WITH (CTE)
+	q.with = make([]WithQuery, len(src.with))
+	for i, w := range src.with {
+		q.with[i] = WithQuery{
+			name:      w.name,
+			recursive: w.recursive,
+			query:     w.query,
+		}
+	}
+
+	// Query comment
+	q.comment = src.comment
+}
+
+// CloneConditions creates a deep copy of the query conditions (WHERE, GROUP BY,
+// HAVING, ORDER BY, JOINs, etc.) but not limit/offset.
+func (q *SelectQuery) CloneConditions() *SelectQuery {
+	if q == nil {
+		return nil
+	}
+
+	var tableModel TableModel
+	if q.tableModel != nil {
+		tableModel = q.tableModel.clone()
+	}
+	clone := &SelectQuery{
+		whereBaseQuery: whereBaseQuery{
+			baseQuery: baseQuery{
+				db:             q.db,
+				table:          q.table,
+				model:          q.model,
+				tableModel:     tableModel,
+				modelTableName: q.modelTableName,
+			},
+		},
+	}
+	clone.CopyConditionsFrom(q)
+	return clone
+}
+
+func cloneQueryArgs(args []schema.QueryWithArgs) []schema.QueryWithArgs {
+	if args == nil {
+		return nil
+	}
+	clone := make([]schema.QueryWithArgs, len(args))
+	for i, a := range args {
+		clone[i] = schema.SafeQuery(
+			a.Query,
+			append([]any(nil), a.Args...),
+		)
+	}
+	return clone
+}
+
+func cloneIndexHints(hints *indexHints) *indexHints {
+	if hints == nil {
+		return nil
+	}
+	return &indexHints{
+		names:      cloneQueryArgs(hints.names),
+		forJoin:    cloneQueryArgs(hints.forJoin),
+		forOrderBy: cloneQueryArgs(hints.forOrderBy),
+		forGroupBy: cloneQueryArgs(hints.forGroupBy),
+	}
+}
+
 //------------------------------------------------------------------------------
 
 // QueryBuilder wraps the SelectQuery in a generic QueryBuilder interface.

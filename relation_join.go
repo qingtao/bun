@@ -183,14 +183,17 @@ func (j *relationJoin) manyQueryWithWindowFunction(limit, offset int64, q *Selec
 	q.setLimit(0)
 	q.setOffset(0)
 
-	// Apply all user conditions from tempQ to the inner query
-	q.where = tempQ.where
-	q.group = tempQ.group
-	q.having = tempQ.having
-	// Note: We DON'T copy q.order here because:
+	// Copy all user conditions from tempQ to the inner query.
+	// CopyConditionsFrom handles all condition types (WHERE, GROUP BY, HAVING, etc.)
+	// and automatically skips limit/offset, so new condition fields added to SelectQuery
+	// will be included without requiring manual updates here.
+	q.CopyConditionsFrom(tempQ)
+
+	// Clear ORDER BY from the inner query because:
 	// 1. We've already extracted orderByCols from tempQ.order for the window function
 	// 2. The ORDER BY in the subquery is unnecessary since we only use id and _row_num
 	// 3. The window function already defines the ordering
+	q.order = nil
 
 	// Build window function
 	// PARTITION BY: using the join keys (foreign key in child table)
